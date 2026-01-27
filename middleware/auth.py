@@ -5,7 +5,7 @@ from fastapi import Request, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
-from typing import Optional
+from typing import Optional, Dict, Any
 import logging
 
 logger = logging.getLogger(__name__)
