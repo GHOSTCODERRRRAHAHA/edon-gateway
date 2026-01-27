@@ -40,7 +40,7 @@ if warnings:
 
 app = FastAPI(
     title="EDON Gateway",
-    version="1.0.0",
+    version="1.0.1",
     description="AI Agent Safety Layer with Governance and Policy Enforcement",
     docs_url="/docs",
     redoc_url="/redoc",
