@@ -60,9 +60,21 @@ app.add_middleware(RateLimitMiddleware)
 app.add_middleware(AuthMiddleware)
 
 # CORS configuration
+# When allow_credentials=True, cannot use wildcard "*" - must specify origins
+cors_origins = config.CORS_ORIGINS
+if "*" in cors_origins:
+    # Default to common development and production origins
+    cors_origins = [
+        "http://localhost:5173",
+        "http://localhost:3000", 
+        "https://edoncore.com",
+        "https://www.edoncore.com"
+    ]
+    logger.warning("CORS wildcard detected - using default origins. Set EDON_CORS_ORIGINS for production.")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.CORS_ORIGINS if "*" not in config.CORS_ORIGINS else ["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1832,7 +1844,7 @@ async def get_integrations(request: Request):
     # Get Clawdbot credentials (if set)
     clawdbot_creds = db.get_credentials_by_tool("clawdbot")
     
-    endpoint = f"https://api.edon.ai/{tenant_id}/clawdbot/invoke"
+    endpoint = f"https://api-edon.onrender.com/{tenant_id}/clawdbot/invoke"
     
     return {
         "endpoint": endpoint,
