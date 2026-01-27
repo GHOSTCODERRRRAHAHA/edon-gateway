@@ -1240,6 +1240,21 @@ def _execute_tool(action: Action) -> Dict[str, Any]:
 # Auth Provider Abstraction Layer
 # ============================================
 
+# Auth provider abstraction - Session Claims Contract
+class SessionClaims(BaseModel):
+    """Standardized session claims contract (auth provider agnostic).
+    
+    This contract allows easy migration between auth providers.
+    All auth providers must yield these claims when validating tokens.
+    """
+    user_id: str  # Internal UUID (never changes)
+    tenant_id: str  # Tenant UUID
+    email: str
+    role: str  # 'user', 'admin', etc.
+    plan: str  # 'starter', 'pro', 'enterprise'
+    status: str  # 'active', 'trial', 'past_due', 'canceled', 'inactive'
+
+
 def validate_clerk_token(clerk_token: str) -> Optional[SessionClaims]:
     """Validate Clerk token and return standardized session claims.
     
@@ -1290,21 +1305,6 @@ def validate_clerk_token(clerk_token: str) -> Optional[SessionClaims]:
     except Exception as e:
         logger.error(f"Clerk token validation failed: {e}")
         return None
-
-
-# Auth provider abstraction - Session Claims Contract
-class SessionClaims(BaseModel):
-    """Standardized session claims contract (auth provider agnostic).
-    
-    This contract allows easy migration between auth providers.
-    All auth providers must yield these claims when validating tokens.
-    """
-    user_id: str  # Internal UUID (never changes)
-    tenant_id: str  # Tenant UUID
-    email: str
-    role: str  # 'user', 'admin', etc.
-    plan: str  # 'starter', 'pro', 'enterprise'
-    status: str  # 'active', 'trial', 'past_due', 'canceled', 'inactive'
 
 
 class AuthProviderRequest(BaseModel):
