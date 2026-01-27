@@ -1285,6 +1285,35 @@ def validate_clerk_token(clerk_token: str) -> Optional[SessionClaims]:
         return None
 
 
+# Auth provider abstraction - Session Claims Contract
+class SessionClaims(BaseModel):
+    """Standardized session claims contract (auth provider agnostic).
+    
+    This contract allows easy migration between auth providers.
+    All auth providers must yield these claims when validating tokens.
+    """
+    user_id: str  # Internal UUID (never changes)
+    tenant_id: str  # Tenant UUID
+    email: str
+    role: str  # 'user', 'admin', etc.
+    plan: str  # 'starter', 'pro', 'enterprise'
+    status: str  # 'active', 'trial', 'past_due', 'canceled', 'inactive'
+
+
+class AuthProviderRequest(BaseModel):
+    """Request to link auth provider account."""
+    auth_provider: str  # 'clerk', 'supabase', etc.
+    auth_subject: str  # Provider's user ID
+    email: str
+
+
+class AuthProviderResponse(BaseModel):
+    """Response after linking auth provider."""
+    user_id: str  # Internal UUID
+    tenant_id: str
+    session_token: str  # EDON session token (JWT or similar)
+
+
 @app.post("/auth/signup", response_model=AuthProviderResponse)
 async def auth_signup(request: AuthProviderRequest):
     """Create or link auth provider account to EDON user/tenant.
@@ -1397,35 +1426,6 @@ class SignupResponse(BaseModel):
     tenant_id: str
     checkout_url: Optional[str] = None
     message: str
-
-
-# Auth provider abstraction - Session Claims Contract
-class SessionClaims(BaseModel):
-    """Standardized session claims contract (auth provider agnostic).
-    
-    This contract allows easy migration between auth providers.
-    All auth providers must yield these claims when validating tokens.
-    """
-    user_id: str  # Internal UUID (never changes)
-    tenant_id: str  # Tenant UUID
-    email: str
-    role: str  # 'user', 'admin', etc.
-    plan: str  # 'starter', 'pro', 'enterprise'
-    status: str  # 'active', 'trial', 'past_due', 'canceled', 'inactive'
-
-
-class AuthProviderRequest(BaseModel):
-    """Request to link auth provider account."""
-    auth_provider: str  # 'clerk', 'supabase', etc.
-    auth_subject: str  # Provider's user ID
-    email: str
-
-
-class AuthProviderResponse(BaseModel):
-    """Response after linking auth provider."""
-    user_id: str  # Internal UUID
-    tenant_id: str
-    session_token: str  # EDON session token (JWT or similar)
 
 
 @app.post("/billing/signup", response_model=SignupResponse)
