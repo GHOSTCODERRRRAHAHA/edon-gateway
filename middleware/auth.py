@@ -121,13 +121,18 @@ class AuthMiddleware(BaseHTTPMiddleware):
         "/health",
         "/docs",
         "/openapi.json",
-        "/redoc"
+        "/redoc",
+        "/auth/signup",  # Public - creates account
+        "/auth/session",  # Public - gets session from Clerk token
+        "/billing/checkout",  # Public - initiates Stripe checkout
+        "/billing/webhook"  # Public - called by Stripe
     }
     
     async def dispatch(self, request: Request, call_next):
         """Process request and validate authentication."""
-        # Skip auth for public endpoints
-        if request.url.path in self.PUBLIC_ENDPOINTS:
+        # Skip auth for public endpoints (handle trailing slashes)
+        path = request.url.path.rstrip('/')
+        if path in self.PUBLIC_ENDPOINTS or request.url.path in self.PUBLIC_ENDPOINTS:
             return await call_next(request)
         
         # Skip auth if disabled
