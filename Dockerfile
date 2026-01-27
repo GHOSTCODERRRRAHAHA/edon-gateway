@@ -5,8 +5,8 @@ WORKDIR /app
 # Install system dependencies (curl for health check only)
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements from repo root (build context should be repo root)
-COPY requirements.gateway.txt ./requirements.gateway.txt
+# Copy requirements from edon_gateway directory (self-contained)
+COPY edon_gateway/requirements.gateway.txt ./requirements.gateway.txt
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.gateway.txt
