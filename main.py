@@ -1857,9 +1857,54 @@ async def get_integrations(request: Request):
     }
 
 
+@app.get("/demo/credentials")
+async def get_demo_credentials():
+    """Get demo credentials for testing (only available in demo mode).
+    
+    Returns demo tenant_id and API key for testing without payment.
+    """
+    from .config import config
+    
+    if not config.DEMO_MODE:
+        raise HTTPException(
+            status_code=403, 
+            detail="Demo mode is not enabled. Set EDON_DEMO_MODE=true to enable."
+        )
+    
+    return {
+        "tenant_id": config.DEMO_TENANT_ID,
+        "api_key": config.DEMO_API_KEY,
+        "status": "active",
+        "plan": "starter",
+        "message": "Demo mode active - subscription checks bypassed"
+    }
+
+
 @app.get("/billing/status")
 async def get_billing_status(request: Request):
     """Get billing status for the authenticated tenant."""
+    from .config import config
+    
+    # In demo mode, return demo status without auth
+    if config.DEMO_MODE:
+        return {
+            "tenant_id": config.DEMO_TENANT_ID,
+            "email": "demo@edon.ai",
+            "status": "active",
+            "plan": "starter",
+            "plan_limits": {
+                "requests_per_month": 10000,
+                "requests_per_day": 500,
+                "requests_per_minute": 60
+            },
+            "usage": {
+                "monthly": 0,
+                "daily": 0
+            },
+            "current_period_end": None,
+            "demo_mode": True
+        }
+    
     # Get tenant from request state
     if not hasattr(request.state, 'tenant_id'):
         raise HTTPException(status_code=401, detail="Authentication required")

@@ -7,6 +7,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 from typing import Optional, Dict, Any
 import logging
+from ..config import config
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +126,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         "/auth/signup",  # Public - creates account
         "/auth/session",  # Public - gets session from Clerk token
         "/billing/checkout",  # Public - initiates Stripe checkout
-        "/billing/webhook"  # Public - called by Stripe
+        "/billing/webhook",  # Public - called by Stripe
+        "/demo/credentials"  # Public - get demo credentials (if demo mode enabled)
     }
     
     async def dispatch(self, request: Request, call_next):
@@ -163,16 +165,23 @@ class AuthMiddleware(BaseHTTPMiddleware):
             tenant_status = tenant_info.get("status")
             tenant_plan = tenant_info.get("plan")
             
-            # Check if tenant is active
-            if tenant_status not in ["active", "trial"]:
-                return JSONResponse(
-                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    content={
-                        "detail": f"Subscription inactive. Status: {tenant_status}",
-                        "status": tenant_status,
-                        "plan": tenant_plan
-                    }
-                )
+            # Demo mode: bypass subscription checks
+            if config.DEMO_MODE:
+                # Override status to active for demo
+                tenant_info["status"] = "active"
+                tenant_info["plan"] = tenant_plan or "starter"
+                tenant_status = "active"
+            else:
+                # Check if tenant is active
+                if tenant_status not in ["active", "trial"]:
+                    return JSONResponse(
+                        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                        content={
+                            "detail": f"Subscription inactive. Status: {tenant_status}",
+                            "status": tenant_status,
+                            "plan": tenant_plan
+                        }
+                    )
             
             # Check usage limits
             try:
