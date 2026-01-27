@@ -165,6 +165,11 @@ else:
 @app.on_event("startup")
 async def startup_event():
     """Validate database schema version on startup and initialize Prometheus metrics."""
+    logger.info("=" * 60)
+    logger.info("Starting EDON Gateway...")
+    logger.info(f"Gateway version: {app.version}")
+    logger.info("=" * 60)
+    
     from .persistence.schema_version import check_schema_version, set_schema_version, get_current_schema_version, SCHEMA_VERSION
     if not check_schema_version(db):
         current_version = get_current_schema_version(db)
@@ -179,6 +184,8 @@ async def startup_event():
     if config.METRICS_ENABLED:
         prometheus_active_intents.set(len(db.list_intents()))
         prometheus_uptime_seconds.set(0)
+    
+    logger.info("EDON Gateway startup complete")
 
 
 # Request/Response Models
