@@ -1533,9 +1533,6 @@ async def create_checkout(request: CreateCheckoutRequest):
         if not tenant:
             raise HTTPException(status_code=404, detail="Tenant not found")
         
-        if not tenant.get("stripe_customer_id"):
-            raise HTTPException(status_code=400, detail="Stripe customer not found")
-        
         import os
         
         # Use Stripe Payment Links for Starter plan (simpler, no customer required upfront)
