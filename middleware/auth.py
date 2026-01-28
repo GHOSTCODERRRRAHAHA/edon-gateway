@@ -120,14 +120,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
     # Endpoints that don't require authentication (public endpoints only)
     PUBLIC_ENDPOINTS = {
         "/health",
+        "/healthz",  # Render health check
         "/docs",
         "/openapi.json",
         "/redoc",
         "/auth/signup",  # Public - creates account
         "/auth/session",  # Public - gets session from Clerk token
         "/billing/checkout",  # Public - initiates Stripe checkout
-        "/billing/webhook",  # Public - called by Stripe
-        "/demo/credentials"  # Public - get demo credentials (if demo mode enabled)
+        "/billing/webhook"  # Public - called by Stripe
     }
     
     async def dispatch(self, request: Request, call_next):

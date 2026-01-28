@@ -630,6 +630,7 @@ async def get_decision(decision_id: str):
 
 
 @app.get("/health", response_model=HealthResponse)
+@app.get("/healthz", response_model=HealthResponse)  # Render health check alias
 async def health():
     """Health check endpoint for load balancers and monitoring."""
     import time
