@@ -63,13 +63,18 @@ app.add_middleware(AuthMiddleware)
 # When allow_credentials=True, cannot use wildcard "*" - must specify origins
 cors_origins = config.CORS_ORIGINS
 if "*" in cors_origins:
-    # Default to common development and production origins
+    # Default to production origins only
     cors_origins = [
-        "http://localhost:5173",
-        "http://localhost:3000", 
         "https://edoncore.com",
         "https://www.edoncore.com"
     ]
+    # Add localhost only in development (not production)
+    import os
+    if os.getenv("ENVIRONMENT") != "production" and os.getenv("EDON_ENV") != "production":
+        cors_origins.extend([
+            "http://localhost:5173",
+            "http://localhost:3000"
+        ])
     logger.warning("CORS wildcard detected - using default origins. Set EDON_CORS_ORIGINS for production.")
 
 app.add_middleware(

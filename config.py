@@ -58,6 +58,9 @@ class Config:
     CLAWDBOT_GATEWAY_URL: Optional[str] = os.getenv("CLAWDBOT_GATEWAY_URL")
     CLAWDBOT_GATEWAY_TOKEN: Optional[str] = os.getenv("CLAWDBOT_GATEWAY_TOKEN")
     
+    # Clerk Authentication
+    CLERK_SECRET_KEY: Optional[str] = os.getenv("CLERK_SECRET_KEY")
+    
     # Demo Mode (bypasses subscription checks for testing)
     DEMO_MODE: bool = os.getenv("EDON_DEMO_MODE", "false").lower() == "true"
     DEMO_TENANT_ID: str = os.getenv("EDON_DEMO_TENANT_ID", "demo_tenant_001")
