@@ -1,6 +1,10 @@
 """EDON Gateway FastAPI application."""
 
+# NOTE: dotenv loading is now handled in config.py (at the very top)
+# Do NOT load dotenv here - config.py handles it before Config class is defined
+
 from fastapi import FastAPI, HTTPException, Depends, status, Header, Request, Response
+from starlette.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -8,6 +12,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest, Counter, His
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from datetime import datetime, UTC
+import os
 
 from .governor import EDONGovernor
 from .schemas import Action, Decision, IntentContract, Tool, RiskLevel, Verdict, ActionSource
@@ -27,6 +32,8 @@ from .benchmarking import get_trust_spec_sheet, get_benchmark_collector
 from .logging_config import setup_logging, get_logger
 from .config import config
 from .monitoring.metrics import metrics as metrics_collector
+from .routes.integrations import router as integrations_router
+from .routes.integrations import get_integration_status as integrations_account_handler
 
 # Setup logging
 setup_logging()
@@ -47,6 +54,18 @@ app = FastAPI(
     openapi_url="/openapi.json"
 )
 
+# Request ID + security headers middleware
+@app.middleware("http")
+async def request_id_and_security_headers(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or os.urandom(8).hex()
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-XSS-Protection"] = "0"
+    return response
+
 # Middleware order matters - add in reverse order of execution
 # Validation first (innermost), then rate limiting, then auth (outermost)
 
@@ -59,10 +78,18 @@ app.add_middleware(RateLimitMiddleware)
 # Authentication middleware (validates X-EDON-TOKEN header)
 app.add_middleware(AuthMiddleware)
 
+# Include routers
+app.include_router(integrations_router)
+
 # CORS configuration
 # When allow_credentials=True, cannot use wildcard "*" - must specify origins
 cors_origins = config.CORS_ORIGINS
 if "*" in cors_origins:
+    if config.is_production():
+        raise RuntimeError(
+            "EDON_CORS_ORIGINS cannot include '*' in production. "
+            "Set explicit origins for the agent UI and production domains."
+        )
     # Default to production origins only
     cors_origins = [
         "https://edoncore.com",
@@ -73,7 +100,11 @@ if "*" in cors_origins:
     if os.getenv("ENVIRONMENT") != "production" and os.getenv("EDON_ENV") != "production":
         cors_origins.extend([
             "http://localhost:5173",
-            "http://localhost:3000"
+            "http://localhost:3000",
+            "http://localhost:8080",  # Agent UI dev server (Vite configured port)
+            "http://127.0.0.1:8080",
+            "http://localhost:5174",  # Vite default fallback port
+            "http://[::1]:8080",  # IPv6 localhost
         ])
     logger.warning("CORS wildcard detected - using default origins. Set EDON_CORS_ORIGINS for production.")
 
@@ -189,6 +220,27 @@ async def startup_event():
     if config.METRICS_ENABLED:
         prometheus_active_intents.set(len(db.list_intents()))
         prometheus_uptime_seconds.set(0)
+    
+    # Network gating validation
+    if config.NETWORK_GATING:
+        from .security.network_gating import validate_network_gating, get_clawdbot_base_url
+        base_url = get_clawdbot_base_url()
+        is_valid, reachability, risk, recommendation = validate_network_gating(base_url, True)
+        
+        if not is_valid:
+            error_msg = (
+                f"Network gating validation failed: Clawdbot Gateway is {reachability} (risk: {risk}).\n"
+                f"Bypass risk detected - agents could call Clawdbot Gateway directly.\n\n"
+                f"Recommendation:\n{recommendation}\n\n"
+                f"To fix:\n"
+                f"1. Set Clawdbot Gateway to loopback/private address (e.g., http://127.0.0.1:18789 or http://clawdbot-gateway:18789)\n"
+                f"2. Or disable network gating: EDON_NETWORK_GATING=false (not recommended for production)\n"
+                f"3. See NETWORK_ISOLATION_GUIDE.md for detailed setup instructions."
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+        
+        logger.info(f"Network gating validation passed: Clawdbot Gateway is {reachability} (risk: {risk})")
     
     logger.info("EDON Gateway startup complete")
 
@@ -698,23 +750,73 @@ async def list_available_policy_packs():
 @app.post("/policy-packs/{pack_name}/apply")
 async def apply_policy_pack_endpoint(
     pack_name: str,
+    request: Request,
     objective: Optional[str] = None
 ):
-    """Apply a policy pack and create an intent.
+    """Apply a policy pack and create an intent with clawdbot.invoke scope.
+    
+    This creates an intent contract that includes clawdbot.invoke in scope,
+    ensuring Clawdbot users have a smooth experience without "not in scope" errors.
+    
+    For Clawdbot-specific packs (e.g., clawdbot_safe), the constraints include
+    the allowed_clawdbot_tools list which is enforced during action evaluation.
     
     Args:
-        pack_name: Policy pack name (personal_safe, work_safe, ops_admin)
+        pack_name: Policy pack name (personal_safe, work_safe, ops_admin, clawdbot_safe)
         objective: Optional custom objective
+        request: FastAPI request (for tenant context if available)
         
     Returns:
-        Created intent contract
+        Created intent contract with intent_id (use this in X-Intent-ID header)
+        
+    Example Response:
+        {
+            "intent_id": "intent_abc123",
+            "policy_pack": "clawdbot_safe",
+            "intent": {...},
+            "active_preset": "clawdbot_safe",
+            "message": "Use X-Intent-ID header: intent_abc123"
+        }
     """
+    import uuid
+    
     try:
         intent_dict = apply_policy_pack(pack_name, objective)
         
+        # Ensure clawdbot.invoke is in scope (critical for Clawdbot users)
+        if "clawdbot" not in intent_dict["scope"]:
+            intent_dict["scope"]["clawdbot"] = []
+        if "invoke" not in intent_dict["scope"]["clawdbot"]:
+            intent_dict["scope"]["clawdbot"].append("invoke")
+        
+        # For Clawdbot-specific packs, ensure constraints include allowed_clawdbot_tools
+        # This is already set in the pack definition, but we validate it here
+        if pack_name == "clawdbot_safe" or "clawdbot" in intent_dict.get("scope", {}):
+            constraints = intent_dict.get("constraints", {})
+            if "allowed_clawdbot_tools" not in constraints:
+                constraints["allowed_clawdbot_tools"] = []
+            if "blocked_clawdbot_tools" not in constraints:
+                constraints["blocked_clawdbot_tools"] = []
+            # Ensure web_execute is blocked by default for clawdbot_safe
+            if pack_name == "clawdbot_safe":
+                blocked = constraints.get("blocked_clawdbot_tools", [])
+                if "web_execute" not in blocked:
+                    blocked.append("web_execute")
+                constraints["blocked_clawdbot_tools"] = blocked
+            intent_dict["constraints"] = constraints
+        
+        # Generate unique intent_id (include tenant if available for multi-tenancy)
+        tenant_id = None
+        if request and hasattr(request.state, 'tenant_id'):
+            tenant_id = request.state.tenant_id
+            intent_id = f"intent_{tenant_id}_{pack_name}_{uuid.uuid4().hex[:8]}"
+        else:
+            # Fallback: use UUID-based intent_id for single-tenant or demo
+            intent_id = f"intent_{pack_name}_{uuid.uuid4().hex[:12]}"
+        
         # Save intent to database
-        intent_id = db.save_intent(
-            intent_id=f"preset_{pack_name}",
+        db.save_intent(
+            intent_id=intent_id,
             objective=intent_dict["objective"],
             scope=intent_dict["scope"],
             constraints=intent_dict["constraints"],
@@ -725,11 +827,20 @@ async def apply_policy_pack_endpoint(
         # Persist active preset in database
         db.set_active_policy_preset(pack_name, applied_by="api")
         
+        # Set as tenant default intent if tenant_id available
+        if tenant_id:
+            db.update_tenant_default_intent(tenant_id, intent_id)
+            logger.info(f"Set default_intent_id for tenant '{tenant_id}': {intent_id}")
+        
+        logger.info(f"Policy pack '{pack_name}' applied with intent_id '{intent_id}'. Scope includes clawdbot.invoke: {intent_dict['scope'].get('clawdbot', [])}")
+        
         return {
             "intent_id": intent_id,
             "policy_pack": pack_name,
             "intent": intent_dict,
-            "active_preset": pack_name
+            "active_preset": pack_name,
+            "message": f"Policy pack applied. Intent ID saved as default for tenant.",
+            "scope_includes_clawdbot": "invoke" in intent_dict["scope"].get("clawdbot", [])
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -771,6 +882,193 @@ def metrics():
             detail="Metrics collection is disabled. Set EDON_METRICS_ENABLED=true to enable."
         )
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/timeseries")
+async def get_timeseries(days: int = 7):
+    """Get time series data for decisions over time.
+    
+    Args:
+        days: Number of days to look back (default: 7, max: 30)
+    
+    Returns:
+        List of time series points with decision counts by verdict
+    """
+    from datetime import datetime, timedelta, UTC
+    from collections import defaultdict
+    
+    # Limit days to reasonable range
+    days = min(max(days, 1), 30)
+    
+    # Calculate time range
+    end_time = datetime.now(UTC)
+    start_time = end_time - timedelta(days=days)
+    
+    # Get all decisions in time range
+    all_decisions = db.query_decisions(limit=100000)
+    
+    # Filter by time range and group by hour/day
+    time_buckets = defaultdict(lambda: {"allowed": 0, "blocked": 0, "confirm": 0})
+    
+    for decision in all_decisions:
+        created_at_str = decision.get("created_at") or decision.get("timestamp")
+        if not created_at_str:
+            continue
+        
+        try:
+            # Parse timestamp (ISO format)
+            if isinstance(created_at_str, str):
+                if 'T' in created_at_str:
+                    decision_time = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+                else:
+                    decision_time = datetime.strptime(created_at_str, "%Y-%m-%d %H:%M:%S")
+                    decision_time = decision_time.replace(tzinfo=UTC)
+            else:
+                continue
+        except (ValueError, AttributeError):
+            continue
+        
+        # Skip if outside time range
+        if decision_time < start_time or decision_time > end_time:
+            continue
+        
+        # Group by hour for <= 7 days, by day for > 7 days
+        if days <= 7:
+            bucket_key = decision_time.strftime("%Y-%m-%d %H:00")
+            label = decision_time.strftime("%m/%d %H:00")
+        else:
+            bucket_key = decision_time.strftime("%Y-%m-%d")
+            label = decision_time.strftime("%m/%d")
+        
+        # Get verdict and map to UI format
+        verdict = decision.get("verdict", "").upper()
+        if verdict == "ALLOW":
+            time_buckets[bucket_key]["allowed"] += 1
+        elif verdict == "BLOCK":
+            time_buckets[bucket_key]["blocked"] += 1
+        elif verdict in ["ESCALATE", "DEGRADE", "PAUSE"]:
+            time_buckets[bucket_key]["confirm"] += 1
+        
+        # Store label if not set
+        if "label" not in time_buckets[bucket_key]:
+            time_buckets[bucket_key]["label"] = label
+            time_buckets[bucket_key]["timestamp"] = decision_time.isoformat()
+    
+    # Convert to list and sort by timestamp
+    result = []
+    for bucket_key, counts in sorted(time_buckets.items()):
+        result.append({
+            "timestamp": counts.get("timestamp", bucket_key),
+            "label": counts.get("label", bucket_key),
+            "allowed": counts["allowed"],
+            "blocked": counts["blocked"],
+            "confirm": counts["confirm"],
+        })
+    
+    return result
+
+
+@app.get("/block-reasons")
+async def get_block_reasons(days: int = 7):
+    """Get top block reasons from decisions.
+    
+    Returns:
+        List of block reasons with counts, sorted by count descending
+    """
+    from collections import Counter
+    from datetime import datetime, timedelta, UTC
+    
+    # Get all decisions (filter to window below)
+    all_decisions = db.query_decisions(limit=100000)
+
+    # Time window (defaults to last 7 days)
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(days=max(days, 0)) if days else None
+
+    def parse_ts(value):
+        if not value:
+            return None
+        if isinstance(value, (int, float)):
+            # Heuristic: ms vs seconds
+            ts = value / 1000 if value > 1e12 else value
+            return datetime.fromtimestamp(ts, UTC)
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except Exception:
+                return None
+        return None
+    
+    # Filter blocked decisions and count reason codes
+    block_reasons = Counter()
+    
+    for decision in all_decisions:
+        decision_time = parse_ts(decision.get("timestamp") or decision.get("created_at"))
+        if cutoff and (decision_time is None or decision_time < cutoff):
+            continue
+        verdict = decision.get("verdict", "").upper()
+        if verdict == "BLOCK":
+            reason_code = decision.get("reason_code", "UNKNOWN")
+            explanation = decision.get("explanation", "")
+            
+            # Use explanation if available, otherwise reason_code
+            reason_text = explanation if explanation else reason_code
+            block_reasons[reason_text] += 1
+    
+    # Convert to list format and sort by count
+    result = [
+        {"reason": reason, "count": count}
+        for reason, count in block_reasons.most_common(10)  # Top 10
+    ]
+    
+    return result
+
+
+@app.get("/debug/auth")
+async def debug_auth_status():
+    """Return safe auth/config info for debugging (no secrets)."""
+    env_path = Path(__file__).parent / ".env"
+    environment = os.getenv("ENVIRONMENT") or os.getenv("EDON_ENV") or "development"
+    token_fallback_enabled = config.AUTH_ENABLED and not config.is_production()
+
+    return {
+        "environment": environment,
+        "auth_enabled": config.AUTH_ENABLED,
+        "credentials_strict": config.CREDENTIALS_STRICT,
+        "token_hardening": config.TOKEN_HARDENING,
+        "token_fallback_enabled": token_fallback_enabled,
+        "env_file": {
+            "path": str(env_path),
+            "exists": env_path.exists(),
+        },
+        "cors_origins": config.CORS_ORIGINS,
+    }
+
+
+@app.get("/debug/auth-public")
+async def debug_auth_public():
+    """Public auth debug info (no secrets) for local troubleshooting."""
+    env_path = Path(__file__).parent / ".env"
+    environment = os.getenv("ENVIRONMENT") or os.getenv("EDON_ENV") or "development"
+    api_token = config.API_TOKEN or ""
+    token_is_default = api_token in ["", "your-secret-token", "your-secret-token-change-me", "production-token-change-me"]
+
+    return {
+        "environment": environment,
+        "auth_enabled": config.AUTH_ENABLED,
+        "credentials_strict": config.CREDENTIALS_STRICT,
+        "token_hardening": config.TOKEN_HARDENING,
+        "token_fallback_enabled": config.AUTH_ENABLED and not config.is_production(),
+        "api_token": {
+            "length": len(api_token),
+            "last4": api_token[-4:] if api_token else "",
+            "is_default": token_is_default,
+        },
+        "env_file": {
+            "path": str(env_path),
+            "exists": env_path.exists(),
+        },
+    }
 
 
 @app.get("/stats", response_model=MetricsResponse)
@@ -921,7 +1219,8 @@ class ClawdbotInvokeResponse(BaseModel):
 # This provides a prettier name but uses the same implementation
 @app.post("/edon/invoke", response_model=ClawdbotInvokeResponse)
 async def edon_invoke_alias(
-    request: ClawdbotInvokeRequest,
+    http_request: Request,
+    payload: ClawdbotInvokeRequest,
     x_agent_id: Optional[str] = Header(None, alias="X-Agent-ID"),
     x_edon_agent_id: Optional[str] = Header(None, alias="X-EDON-Agent-ID"),
     x_intent_id: Optional[str] = Header(None, alias="X-Intent-ID")
@@ -933,7 +1232,8 @@ async def edon_invoke_alias(
     """
     # Call the same handler function
     return await clawdbot_invoke_proxy(
-        request=request,
+        http_request=http_request,
+        payload=payload,
         x_agent_id=x_agent_id,
         x_edon_agent_id=x_edon_agent_id,
         x_intent_id=x_intent_id
@@ -942,7 +1242,8 @@ async def edon_invoke_alias(
 
 @app.post("/clawdbot/invoke", response_model=ClawdbotInvokeResponse)
 async def clawdbot_invoke_proxy(
-    request: ClawdbotInvokeRequest,
+    http_request: Request,
+    payload: ClawdbotInvokeRequest,
     x_agent_id: Optional[str] = Header(None, alias="X-Agent-ID"),
     x_edon_agent_id: Optional[str] = Header(None, alias="X-EDON-Agent-ID"),
     x_intent_id: Optional[str] = Header(None, alias="X-Intent-ID")
@@ -1003,19 +1304,32 @@ async def clawdbot_invoke_proxy(
             tool=Tool.CLAWDBOT,
             op="invoke",
             params={
-                "tool": request.tool,
-                "action": request.action,
-                "args": request.args,
-                "sessionKey": request.sessionKey
+                "tool": payload.tool,
+                "action": payload.action,
+                "args": payload.args,
+                "sessionKey": payload.sessionKey
             },
             requested_at=datetime.now(UTC),
             source=ActionSource.AGENT,
             tags=["clawdbot-proxy"]
         )
         
-        # Load intent (use default if not provided)
+        # Load intent (use tenant default if not provided)
         intent = None
         intent_id_for_audit = intent_id
+        
+        # Get tenant_id from request state
+        tenant_id = None
+        if http_request and hasattr(http_request.state, 'tenant_id'):
+            tenant_id = http_request.state.tenant_id
+        
+        # If no X-Intent-ID header, try tenant default_intent_id
+        if not intent_id and tenant_id:
+            default_intent_id = db.get_tenant_default_intent(tenant_id)
+            if default_intent_id:
+                intent_id = default_intent_id
+                intent_id_for_audit = intent_id
+                logger.info(f"Using tenant default_intent_id: {intent_id}")
         
         if intent_id:
             intent_data = db.get_intent(intent_id)
@@ -1028,16 +1342,11 @@ async def clawdbot_invoke_proxy(
                     approved_by_user=bool(intent_data["approved_by_user"])
                 )
         
-        # If no intent provided, try to get default intent for clawdbot
+        # If no intent provided, return clean error
         if not intent:
-            # Try to find a default intent for clawdbot
-            # For now, we'll create a permissive default (can be made stricter)
-            intent = IntentContract(
-                objective="Clawdbot tool invocation via EDON proxy",
-                scope={"clawdbot": ["invoke"]},
-                constraints={},
-                risk_level=RiskLevel.LOW,
-                approved_by_user=True
+            raise HTTPException(
+                status_code=400,
+                detail="No intent configured. Apply a policy pack first via POST /policy-packs/{pack_name}/apply"
             )
         
         # Check credentials in strict mode BEFORE governor evaluation
@@ -1085,8 +1394,22 @@ async def clawdbot_invoke_proxy(
             )
         
         # ALLOW or DEGRADE → Execute through Clawdbot connector
+        # Load credential from DB and create connector instance
         try:
-            result = clawdbot_connector.invoke(
+            from .connectors.clawdbot_connector import ClawdbotConnector
+            
+            # Get tenant_id from request state
+            tenant_id = None
+            if http_request and hasattr(http_request.state, 'tenant_id'):
+                tenant_id = http_request.state.tenant_id
+            
+            # Get credential_id from config (loads from DB)
+            credential_id = config.CLAWDBOT_CREDENTIAL_ID
+            
+            # Create connector instance with credential_id and tenant_id (loads from DB)
+            connector = ClawdbotConnector(credential_id=credential_id, tenant_id=tenant_id)
+            
+            result = connector.invoke(
                 tool=request.tool,
                 action=request.action,
                 args=request.args,
@@ -1199,7 +1522,20 @@ def _execute_tool(action: Action) -> Dict[str, Any]:
         
         elif action.tool == Tool.CLAWDBOT:
             if action.op == "invoke":
-                result = clawdbot_connector.invoke(
+                # Load credential from DB and create connector instance
+                from .connectors.clawdbot_connector import ClawdbotConnector
+                
+                # Get tenant_id if available (from request context if available)
+                tenant_id = None
+                # Note: In _execute_tool, we don't have direct access to request
+                # This is called from /execute endpoint which has request context
+                # For now, use default credential_id
+                credential_id = config.CLAWDBOT_CREDENTIAL_ID
+                
+                # Create connector instance with credential_id (loads from DB)
+                connector = ClawdbotConnector(credential_id=credential_id, tenant_id=tenant_id)
+                
+                result = connector.invoke(
                     tool=action.params.get("tool", ""),
                     action=action.params.get("action", "json"),
                     args=action.params.get("args", {}),
@@ -1845,22 +2181,7 @@ async def get_integrations(request: Request):
     Returns:
         Clawdbot endpoint URL and instructions
     """
-    if not hasattr(request.state, 'tenant_id'):
-        raise HTTPException(status_code=401, detail="Authentication required")
-    
-    tenant_id = request.state.tenant_id
-    db = get_db()
-    
-    # Get Clawdbot credentials (if set)
-    clawdbot_creds = db.get_credentials_by_tool("clawdbot")
-    
-    endpoint = f"https://api-edon.onrender.com/{tenant_id}/clawdbot/invoke"
-    
-    return {
-        "endpoint": endpoint,
-        "instructions": "Paste this as your Clawdbot Gateway URL",
-        "clawdbot_configured": clawdbot_creds is not None
-    }
+    return await integrations_account_handler(request)
 
 
 @app.get("/demo/credentials")
@@ -1947,6 +2268,38 @@ async def get_billing_status(request: Request):
         },
         "current_period_end": tenant["current_period_end"]
     }
+
+
+# SPA Routing: Catch-all route for React Router (must be LAST, after all API routes)
+# This ensures /audit, /decisions, etc. serve index.html for client-side routing
+try:
+    ui_path = Path(__file__).parent / "ui"
+    console_ui_dist = ui_path / "console-ui" / "dist"
+    
+    if console_ui_dist.exists() and (console_ui_dist / "index.html").exists():
+        @app.get("/{full_path:path}")
+        async def serve_spa(full_path: str, request: Request):
+            """Serve React UI for all non-API routes (SPA routing support).
+            
+            This catch-all route handles client-side routing for React Router.
+            API routes are matched first, so they won't be affected.
+            """
+            # Skip API routes, static files, and docs (these should already be handled)
+            if (full_path.startswith("api/") or 
+                full_path.startswith("docs") or 
+                full_path.startswith("redoc") or 
+                full_path.startswith("openapi.json") or
+                full_path.startswith("health") or
+                full_path.startswith("healthz") or
+                full_path.startswith("assets/") or
+                full_path.startswith("ui/")):
+                raise HTTPException(status_code=404, detail="Not found")
+            
+            # Serve index.html for all other routes (React Router handles routing)
+            return FileResponse(str(console_ui_dist / "index.html"))
+except Exception:
+    # If UI not available, let 404 handler catch it
+    pass
 
 
 if __name__ == "__main__":

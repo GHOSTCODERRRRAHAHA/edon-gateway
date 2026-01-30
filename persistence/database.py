@@ -206,14 +206,17 @@ class Database:
             # Credentials table (for tool credentials)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS credentials (
-                    credential_id TEXT PRIMARY KEY,
+                    credential_id TEXT NOT NULL,
                     tool_name TEXT NOT NULL,
+                    tenant_id TEXT,
                     credential_type TEXT NOT NULL,  -- e.g., "smtp", "api_key", "oauth"
                     credential_data TEXT NOT NULL,  -- JSON encrypted/encoded
                     encrypted INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    last_used_at TEXT
+                    last_used_at TEXT,
+                    last_error TEXT,
+                    PRIMARY KEY (credential_id, tenant_id)
                 )
             """)
             
@@ -258,6 +261,29 @@ class Database:
             """)
             
             conn.commit()
+            
+            # Migration: Add default_intent_id to tenants table (if not exists)
+            try:
+                cursor.execute("ALTER TABLE tenants ADD COLUMN default_intent_id TEXT")
+                conn.commit()
+            except sqlite3.OperationalError:
+                # Column already exists, ignore
+                pass
+            
+            # Migration: Add tenant_id and last_error to credentials table (if not exists)
+            try:
+                cursor.execute("ALTER TABLE credentials ADD COLUMN tenant_id TEXT")
+                conn.commit()
+            except sqlite3.OperationalError:
+                # Column already exists, ignore
+                pass
+            
+            try:
+                cursor.execute("ALTER TABLE credentials ADD COLUMN last_error TEXT")
+                conn.commit()
+            except sqlite3.OperationalError:
+                # Column already exists, ignore
+                pass
             
             # Check and set schema version
             from .schema_version import check_schema_version, set_schema_version, SCHEMA_VERSION
@@ -572,15 +598,16 @@ class Database:
     
     def save_credential(self, credential_id: str, tool_name: str, 
                       credential_type: str, credential_data: Dict[str, Any],
-                      encrypted: bool = False) -> None:
+                      encrypted: bool = False, tenant_id: Optional[str] = None) -> None:
         """Save or update a credential.
         
         Args:
             credential_id: Unique credential identifier
-            tool_name: Tool name (e.g., "email", "filesystem")
-            credential_type: Type of credential (e.g., "smtp", "api_key")
+            tool_name: Tool name (e.g., "email", "filesystem", "clawdbot")
+            credential_type: Type of credential (e.g., "smtp", "api_key", "gateway")
             credential_data: Credential data dictionary
             encrypted: Whether credential_data is encrypted
+            tenant_id: Optional tenant ID for tenant-scoped credentials
             
         Raises:
             ValueError: If validation fails
@@ -601,37 +628,54 @@ class Database:
                 cursor = conn.cursor()
                 cursor.execute("""
                     INSERT OR REPLACE INTO credentials 
-                    (credential_id, tool_name, credential_type, credential_data,
+                    (credential_id, tool_name, tenant_id, credential_type, credential_data,
                      encrypted, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 
-                            COALESCE((SELECT created_at FROM credentials WHERE credential_id = ?), ?), ?)
+                    VALUES (?, ?, ?, ?, ?, ?, 
+                            COALESCE((SELECT created_at FROM credentials WHERE credential_id = ? AND (tenant_id = ? OR (tenant_id IS NULL AND ? IS NULL))), ?), ?)
                 """, (
-                    credential_id, tool_name, credential_type,
+                    credential_id, tool_name, tenant_id, credential_type,
                     json.dumps(credential_data), 1 if encrypted else 0,
-                    credential_id, now, now
+                    credential_id, tenant_id, tenant_id, now, now
                 ))
                 conn.commit()
         except sqlite3.Error as e:
             raise RuntimeError(f"Failed to save credential: {str(e)}") from e
     
-    def get_credential(self, credential_id: str) -> Optional[Dict[str, Any]]:
+    def get_credential(self, credential_id: str, tool_name: Optional[str] = None, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Get a credential by ID.
         
         Args:
             credential_id: Credential identifier
+            tool_name: Optional tool name filter
+            tenant_id: Optional tenant ID for tenant-scoped lookup
             
         Returns:
             Credential dictionary or None if not found
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM credentials WHERE credential_id = ?
-            """, (credential_id,))
+            
+            # Build query with optional filters
+            query = "SELECT * FROM credentials WHERE credential_id = ?"
+            params = [credential_id]
+            
+            if tool_name:
+                query += " AND tool_name = ?"
+                params.append(tool_name)
+            
+            if tenant_id:
+                query += " AND tenant_id = ?"
+                params.append(tenant_id)
+            else:
+                # If no tenant_id specified, prefer tenant-scoped over global
+                # Order by tenant_id DESC so NULL (global) comes last
+                query += " ORDER BY tenant_id DESC LIMIT 1"
+            
+            cursor.execute(query, tuple(params))
             row = cursor.fetchone()
             
             if row:
-                return {
+                result = {
                     "credential_id": row["credential_id"],
                     "tool_name": row["tool_name"],
                     "credential_type": row["credential_type"],
@@ -639,8 +683,15 @@ class Database:
                     "encrypted": bool(row["encrypted"]),
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
-                    "last_used_at": row["last_used_at"]
                 }
+                # Add optional fields if columns exist
+                if "last_used_at" in row.keys():
+                    result["last_used_at"] = row["last_used_at"]
+                if "tenant_id" in row.keys():
+                    result["tenant_id"] = row["tenant_id"]
+                if "last_error" in row.keys():
+                    result["last_error"] = row["last_error"]
+                return result
             return None
     
     def get_credentials_by_tool(self, tool_name: str) -> List[Dict[str, Any]]:
@@ -801,7 +852,7 @@ class Database:
                        intent_id: Optional[str] = None,
                        agent_id: Optional[str] = None,
                        limit: int = 100) -> List[Dict[str, Any]]:
-        """Query decisions.
+        """Query decisions with action details from audit_events.
         
         Args:
             action_id: Filter by action ID
@@ -811,49 +862,94 @@ class Database:
             limit: Maximum number of decisions to return
             
         Returns:
-            List of decision dictionaries
+            List of decision dictionaries with action details
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
             
-            query = "SELECT * FROM decisions WHERE 1=1"
+            # Join with audit_events to get action details (tool, op)
+            query = """
+                SELECT 
+                    d.decision_id,
+                    d.action_id,
+                    d.verdict,
+                    d.reason_code,
+                    d.explanation,
+                    d.policy_version,
+                    d.intent_id,
+                    d.agent_id,
+                    d.created_at,
+                    a.action_tool,
+                    a.action_op,
+                    a.action_params,
+                    a.timestamp
+                FROM decisions d
+                LEFT JOIN audit_events a ON d.action_id = a.action_id
+                WHERE 1=1
+            """
             params = []
             
             if action_id:
-                query += " AND action_id = ?"
+                query += " AND d.action_id = ?"
                 params.append(action_id)
             
             if verdict:
-                query += " AND verdict = ?"
+                query += " AND d.verdict = ?"
                 params.append(verdict)
             
             if intent_id:
-                query += " AND intent_id = ?"
+                query += " AND d.intent_id = ?"
                 params.append(intent_id)
             
             if agent_id:
-                query += " AND agent_id = ?"
+                query += " AND d.agent_id = ?"
                 params.append(agent_id)
             
-            query += " ORDER BY created_at DESC LIMIT ?"
+            query += " ORDER BY d.created_at DESC LIMIT ?"
             params.append(limit)
             
             cursor.execute(query, params)
             
-            return [
-                {
+            results = []
+            for row in cursor.fetchall():
+                # Map verdict to UI format (ALLOW -> allowed, BLOCK -> blocked, etc.)
+                verdict_map = {
+                    "ALLOW": "allowed",
+                    "BLOCK": "blocked",
+                    "ESCALATE": "confirm",
+                    "DEGRADE": "confirm",
+                    "PAUSE": "confirm"
+                }
+                verdict = row["verdict"] or "UNKNOWN"
+                verdict_lower = verdict_map.get(verdict, verdict.lower())
+                
+                decision = {
+                    "id": row["decision_id"],  # Use 'id' for UI compatibility
                     "decision_id": row["decision_id"],
                     "action_id": row["action_id"],
-                    "verdict": row["verdict"],
+                    "verdict": verdict_lower,
                     "reason_code": row["reason_code"],
                     "explanation": row["explanation"],
                     "policy_version": row["policy_version"],
                     "intent_id": row["intent_id"],
-                    "agent_id": row["agent_id"],
-                    "created_at": row["created_at"]
+                    "agent_id": row["agent_id"] or "unknown",
+                    "created_at": row["created_at"],
+                    "timestamp": row["timestamp"] or row["created_at"],  # Use timestamp from audit if available
                 }
-                for row in cursor.fetchall()
-            ]
+                
+                # Add tool information if available
+                if row["action_tool"] and row["action_op"]:
+                    decision["tool"] = {
+                        "name": row["action_tool"],
+                        "op": row["action_op"]
+                    }
+                
+                # Add latency_ms if available (could be calculated from timestamps)
+                decision["latency_ms"] = 0  # Default, can be calculated if needed
+                
+                results.append(decision)
+            
+            return results
     
     def get_decision_by_action_id(self, action_id: str) -> Optional[Dict[str, Any]]:
         """Get decision by action ID (most recent).
@@ -1205,6 +1301,68 @@ class Database:
                     WHERE id = ?
                 """, params)
                 conn.commit()
+    
+    def get_tenant_default_intent(self, tenant_id: str) -> Optional[str]:
+        """Get tenant's default intent ID.
+        
+        Args:
+            tenant_id: Tenant identifier
+            
+        Returns:
+            Intent ID or None if not set
+        """
+        tenant = self.get_tenant(tenant_id)
+        if tenant:
+            return tenant.get("default_intent_id")
+        return None
+
+    def update_tenant_default_intent(self, tenant_id: str, intent_id: str) -> None:
+        """Update tenant's default intent ID.
+        
+        Args:
+            tenant_id: Tenant identifier
+            intent_id: Intent identifier to set as default
+        """
+        now = datetime.now(UTC).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE tenants
+                SET default_intent_id = ?, updated_at = ?
+                WHERE id = ?
+            """, (intent_id, now, tenant_id))
+            conn.commit()
+    
+    def get_integration_status(self, tenant_id: Optional[str], tool_name: str = "clawdbot") -> Dict[str, Any]:
+        """Get integration status for a tool.
+        
+        Args:
+            tenant_id: Optional tenant ID
+            tool_name: Tool name (default: "clawdbot")
+            
+        Returns:
+            Status dictionary with last_ok_at, last_error, base_url, auth_mode
+        """
+        credential_id = f"{tool_name}_gateway_{tenant_id}" if tenant_id else f"{tool_name}_gateway"
+        credential = self.get_credential(credential_id, tool_name=tool_name, tenant_id=tenant_id)
+        
+        if not credential:
+            return {
+                "connected": False,
+                "last_ok_at": None,
+                "last_error": None,
+                "base_url": None,
+                "auth_mode": None
+            }
+        
+        data = credential.get("credential_data", {}) or {}
+        return {
+            "connected": True,
+            "last_ok_at": credential.get("last_used_at"),
+            "last_error": credential.get("last_error"),
+            "base_url": data.get("base_url") or data.get("gateway_url"),
+            "auth_mode": data.get("auth_mode") or "token"
+        }
     
     # API Key management methods
     def create_api_key(self, tenant_id: str, key_hash: str, name: Optional[str] = None) -> str:

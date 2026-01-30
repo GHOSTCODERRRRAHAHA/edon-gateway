@@ -11,9 +11,8 @@ from ..config import config
 
 logger = logging.getLogger(__name__)
 
-# Get auth token from environment
-EDON_AUTH_ENABLED = os.getenv("EDON_AUTH_ENABLED", "false").lower() == "true"
-EDON_API_TOKEN = os.getenv("EDON_API_TOKEN", "")
+# NOTE: Do NOT read env vars here at module level - use config instead
+# Config is loaded AFTER .env is loaded, so it has the correct values
 
 # Security scheme for OpenAPI docs
 security = HTTPBearer(auto_error=False)
@@ -29,7 +28,8 @@ def verify_token(token: str) -> tuple[bool, Optional[Dict[str, Any]]]:
         Tuple of (is_valid, tenant_info_dict)
         tenant_info_dict contains: tenant_id, status, plan, or None if invalid
     """
-    if not EDON_AUTH_ENABLED:
+    # Use config (loaded from .env) instead of module-level env var
+    if not config.AUTH_ENABLED:
         return True, None  # Auth disabled in development
     
     # Try database lookup first (tenant-scoped API keys)
@@ -59,11 +59,16 @@ def verify_token(token: str) -> tuple[bool, Optional[Dict[str, Any]]]:
         logger.debug(f"Database token lookup failed: {e}")
     
     # Fallback to environment variable token (backward compatibility)
-    if not EDON_API_TOKEN:
+    # Disabled in production to enforce tenant-scoped API keys
+    if config.is_production():
+        return False, None
+
+    api_token = config.API_TOKEN
+    if not api_token or api_token == "your-secret-token":
         logger.warning("EDON_AUTH_ENABLED is true but EDON_API_TOKEN is not set")
         return False, None
-    
-    if token == EDON_API_TOKEN:
+
+    if token == api_token:
         return True, None  # Legacy token, no tenant info
     
     return False, None
@@ -124,6 +129,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         "/docs",
         "/openapi.json",
         "/redoc",
+        "/debug/auth-public",
         "/auth/signup",  # Public - creates account
         "/auth/session",  # Public - gets session from Clerk token
         "/billing/checkout",  # Public - initiates Stripe checkout
@@ -137,8 +143,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if path in self.PUBLIC_ENDPOINTS or request.url.path in self.PUBLIC_ENDPOINTS:
             return await call_next(request)
         
-        # Skip auth if disabled
-        if not EDON_AUTH_ENABLED:
+        # Skip auth if disabled (use config loaded from .env)
+        if not config.AUTH_ENABLED:
             return await call_next(request)
         
         # Extract and verify token
@@ -225,10 +231,15 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 logger.error(f"Error checking tenant limits: {e}", exc_info=True)
                 # Fail open for now (don't block requests on billing errors)
                 pass
+        elif (
+            (os.getenv("EDON_ENV") == "development" or os.getenv("ENVIRONMENT") == "development")
+            and token == config.API_TOKEN
+            and not getattr(request.state, "tenant_id", None)
+        ):
+            request.state.tenant_id = os.getenv("EDON_DEV_TENANT_ID", "tenant_dev")
         
-        # Token → agent_id binding (if enabled)
-        import os
-        token_binding_enabled = os.getenv("EDON_TOKEN_BINDING_ENABLED", "false").lower() == "true"
+        # Token → agent_id binding (if enabled) - use config loaded from .env
+        token_binding_enabled = config.TOKEN_BINDING_ENABLED
         
         if token_binding_enabled:
             from ..persistence import get_db
