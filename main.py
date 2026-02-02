@@ -13,6 +13,11 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from datetime import datetime, UTC
 import os
+import json
+import time
+
+import requests
+import jwt
 
 from .governor import EDONGovernor
 from .schemas import Action, Decision, IntentContract, Tool, RiskLevel, Verdict, ActionSource
@@ -20,7 +25,6 @@ from .audit import AuditLogger
 from pathlib import Path
 from .connectors.email_connector import email_connector
 from .connectors.filesystem_connector import filesystem_connector
-from .connectors.clawdbot_connector import clawdbot_connector
 from .middleware import AuthMiddleware, RateLimitMiddleware, ValidationMiddleware
 from .security.anti_bypass import (
     AntiBypassConfig, validate_anti_bypass_setup, get_bypass_resistance_score
@@ -742,7 +746,7 @@ async def list_available_policy_packs():
     """
     return {
         "packs": list_policy_packs(),
-        "default": "personal_safe",
+        "default": "casual_user",
         "active_preset": db.get_active_policy_preset()
     }
 
@@ -1410,10 +1414,10 @@ async def clawdbot_invoke_proxy(
             connector = ClawdbotConnector(credential_id=credential_id, tenant_id=tenant_id)
             
             result = connector.invoke(
-                tool=request.tool,
-                action=request.action,
-                args=request.args,
-                sessionKey=request.sessionKey
+                tool=payload.tool,
+                action=payload.action,
+                args=payload.args,
+                sessionKey=payload.sessionKey
             )
             
             # Convert EDON connector result to Clawdbot format
@@ -1597,6 +1601,38 @@ class SessionClaims(BaseModel):
     status: str  # 'active', 'trial', 'past_due', 'canceled', 'inactive'
 
 
+_JWKS_CACHE: Dict[str, Any] = {"keys": None, "fetched_at": 0}
+
+
+def _get_clerk_jwks(force_refresh: bool = False) -> Optional[list]:
+    ttl_seconds = int(os.getenv("CLERK_JWKS_CACHE_TTL", "3600"))
+    now = time.time()
+
+    if not force_refresh and _JWKS_CACHE.get("keys") and (now - _JWKS_CACHE.get("fetched_at", 0) < ttl_seconds):
+        return _JWKS_CACHE["keys"]
+
+    jwks_url = os.getenv("CLERK_JWKS_URL", "https://api.clerk.com/v1/jwks")
+    headers = {}
+    if config.CLERK_SECRET_KEY:
+        headers["Authorization"] = f"Bearer {config.CLERK_SECRET_KEY}"
+
+    try:
+        resp = requests.get(jwks_url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        payload = resp.json()
+        keys = payload.get("keys") if isinstance(payload, dict) else None
+        if not keys:
+            keys = payload if isinstance(payload, list) else None
+        if not keys:
+            return None
+        _JWKS_CACHE["keys"] = keys
+        _JWKS_CACHE["fetched_at"] = now
+        return keys
+    except Exception as exc:
+        logger.debug(f"Failed to fetch Clerk JWKS: {exc}")
+        return None
+
+
 def validate_clerk_token(clerk_token: str) -> Optional[SessionClaims]:
     """Validate Clerk token and return standardized session claims.
     
@@ -1610,40 +1646,85 @@ def validate_clerk_token(clerk_token: str) -> Optional[SessionClaims]:
         SessionClaims if valid, None if invalid
     """
     try:
-        # TODO: Implement Clerk token validation
-        # For now, this is a placeholder that shows the contract
-        
-        # In production, you would:
-        # 1. Verify Clerk JWT signature
-        # 2. Extract clerk_user_id from token
-        # 3. Look up user in database by auth_provider='clerk', auth_subject=clerk_user_id
-        # 4. Get tenant for that user
-        # 5. Return SessionClaims with user_id, tenant_id, etc.
-        
-        # Example implementation (pseudo-code):
-        # import jwt
-        # decoded = jwt.decode(clerk_token, CLERK_PUBLIC_KEY, algorithms=["RS256"])
-        # clerk_user_id = decoded["sub"]
-        # 
-        # from .persistence import get_db
-        # db = get_db()
-        # user = db.get_user_by_auth("clerk", clerk_user_id)
-        # if not user:
-        #     return None
-        # tenant = db.get_tenant_by_user_id(user["id"])
-        # if not tenant:
-        #     return None
-        # 
-        # return SessionClaims(
-        #     user_id=user["id"],
-        #     tenant_id=tenant["id"],
-        #     email=user["email"],
-        #     role=user["role"],
-        #     plan=tenant["plan"],
-        #     status=tenant["status"]
-        # )
-        
-        return None  # Placeholder
+        if not clerk_token or clerk_token.count(".") != 2:
+            return None
+
+        header = jwt.get_unverified_header(clerk_token)
+        kid = header.get("kid")
+        if not kid:
+            return None
+
+        keys = _get_clerk_jwks() or []
+        key = next((k for k in keys if k.get("kid") == kid), None)
+        if not key:
+            keys = _get_clerk_jwks(force_refresh=True) or []
+            key = next((k for k in keys if k.get("kid") == kid), None)
+        if not key:
+            return None
+
+        public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key))
+        issuer = os.getenv("CLERK_ISSUER")
+        audience = os.getenv("CLERK_AUDIENCE")
+
+        options = {
+            "verify_aud": bool(audience),
+            "verify_iss": bool(issuer),
+        }
+
+        claims = jwt.decode(
+            clerk_token,
+            public_key,
+            algorithms=["RS256"],
+            audience=audience if audience else None,
+            issuer=issuer if issuer else None,
+            options=options,
+        )
+
+        clerk_user_id = claims.get("sub")
+        if not clerk_user_id:
+            return None
+
+        from .persistence import get_db
+        db = get_db()
+        user = db.get_user_by_auth("clerk", clerk_user_id)
+        email = (
+            claims.get("email")
+            or claims.get("email_address")
+            or claims.get("primary_email_address")
+            or "unknown@edoncore.com"
+        )
+
+        if not user:
+            import uuid
+            user_id = str(uuid.uuid4())
+            db.create_user(
+                user_id=user_id,
+                email=email,
+                auth_provider="clerk",
+                auth_subject=clerk_user_id,
+                role="user",
+            )
+        else:
+            user_id = user["id"]
+
+        tenant = db.get_tenant_by_user_id(user_id)
+        if not tenant:
+            import uuid
+            tenant_id = f"tenant_{uuid.uuid4().hex[:12]}"
+            db.create_tenant(tenant_id=tenant_id, user_id=user_id)
+            tenant = db.get_tenant(tenant_id)
+
+        if not tenant:
+            return None
+
+        return SessionClaims(
+            user_id=user_id,
+            tenant_id=tenant["id"],
+            email=email,
+            role=user["role"] if user else "user",
+            plan=tenant["plan"],
+            status=tenant["status"],
+        )
     except Exception as e:
         logger.error(f"Clerk token validation failed: {e}")
         return None
