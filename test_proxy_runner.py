@@ -9,6 +9,7 @@ import requests
 import os
 import json
 import sys
+import pytest
 
 # Configuration
 EDON_GATEWAY_URL = os.getenv("EDON_GATEWAY_URL", "http://127.0.0.1:8000")
@@ -42,8 +43,7 @@ def test_proxy_allowed_tool():
     )
     
     if intent_response.status_code != 200:
-        print(f"  [SKIP] Could not set intent: {intent_response.text}")
-        return False
+        pytest.skip(f"Could not set intent: {intent_response.text}")
     
     intent_id = intent_response.json().get("intent_id")
     print(f"  Intent ID: {intent_id}")
@@ -65,21 +65,14 @@ def test_proxy_allowed_tool():
         timeout=30
     )
     
-    if proxy_response.status_code != 200:
-        print(f"  [FAIL] HTTP {proxy_response.status_code}: {proxy_response.text}")
-        return False
+    assert proxy_response.status_code == 200, f"HTTP {proxy_response.status_code}: {proxy_response.text}"
     
     result = proxy_response.json()
     print(f"  Response: {json.dumps(result, indent=2)}")
     
-    if result.get("ok"):
-        print(f"  [OK] ALLOW test passed")
-        print(f"  EDON verdict: {result.get('edon_verdict')}")
-        return True
-    else:
-        print(f"  [FAIL] Tool was blocked: {result.get('error')}")
-        print(f"  EDON verdict: {result.get('edon_verdict')}")
-        return False
+    assert result.get("ok"), f"Tool was blocked: {result.get('error')}"
+    print(f"  [OK] ALLOW test passed")
+    print(f"  EDON verdict: {result.get('edon_verdict')}")
 
 
 def test_proxy_blocked_tool():
@@ -108,8 +101,7 @@ def test_proxy_blocked_tool():
     )
     
     if intent_response.status_code != 200:
-        print(f"  [SKIP] Could not set intent: {intent_response.text}")
-        return False
+        pytest.skip(f"Could not set intent: {intent_response.text}")
     
     intent_id = intent_response.json().get("intent_id")
     
@@ -130,20 +122,14 @@ def test_proxy_blocked_tool():
         timeout=30
     )
     
-    if proxy_response.status_code != 200:
-        print(f"  [FAIL] HTTP {proxy_response.status_code}: {proxy_response.text}")
-        return False
+    assert proxy_response.status_code == 200, f"HTTP {proxy_response.status_code}: {proxy_response.text}"
     
     result = proxy_response.json()
     print(f"  Response: {json.dumps(result, indent=2)}")
     
-    if not result.get("ok") and result.get("edon_verdict") == "BLOCK":
-        print(f"  [OK] BLOCK test passed")
-        print(f"  Blocked reason: {result.get('error')}")
-        return True
-    else:
-        print(f"  [FAIL] Tool was not blocked (should be BLOCK)")
-        return False
+    assert not result.get("ok") and result.get("edon_verdict") == "BLOCK", "Tool was not blocked (should be BLOCK)"
+    print(f"  [OK] BLOCK test passed")
+    print(f"  Blocked reason: {result.get('error')}")
 
 
 def test_proxy_schema_compatibility():
@@ -167,13 +153,9 @@ def test_proxy_schema_compatibility():
         timeout=30
     )
     
-    if proxy_response.status_code == 200:
-        print(f"  [OK] Schema compatibility test passed")
-        print(f"  Response: {json.dumps(proxy_response.json(), indent=2)}")
-        return True
-    else:
-        print(f"  [FAIL] HTTP {proxy_response.status_code}: {proxy_response.text}")
-        return False
+    assert proxy_response.status_code == 200, f"HTTP {proxy_response.status_code}: {proxy_response.text}"
+    print(f"  [OK] Schema compatibility test passed")
+    print(f"  Response: {json.dumps(proxy_response.json(), indent=2)}")
 
 
 def main():
