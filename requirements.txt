@@ -10,5 +10,8 @@ stripe
 PyJWT
 cryptography
 
+# Tests (CI runs test_regression.py)
+pytest>=7.0.0
+
 # EDON Guard (local import)
 # Assumes edon_demo is in PYTHONPATH or installed
