@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Depends, status, Header, Request, Re
 from starlette.requests import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest, Counter, Histogram, Gauge
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
@@ -233,18 +233,18 @@ async def startup_event():
         
         if not is_valid:
             error_msg = (
-                f"Network gating validation failed: Clawdbot Gateway is {reachability} (risk: {risk}).\n"
-                f"Bypass risk detected - agents could call Clawdbot Gateway directly.\n\n"
+                f"Network gating validation failed: Bot gateway is {reachability} (risk: {risk}).\n"
+                f"Bypass risk detected - agents could call the bot gateway directly.\n\n"
                 f"Recommendation:\n{recommendation}\n\n"
                 f"To fix:\n"
-                f"1. Set Clawdbot Gateway to loopback/private address (e.g., http://127.0.0.1:18789 or http://clawdbot-gateway:18789)\n"
+                f"1. Set bot gateway to loopback/private address (e.g., http://127.0.0.1:18789)\n"
                 f"2. Or disable network gating: EDON_NETWORK_GATING=false (not recommended for production)\n"
                 f"3. See NETWORK_ISOLATION_GUIDE.md for detailed setup instructions."
             )
             logger.error(error_msg)
             raise RuntimeError(error_msg)
         
-        logger.info(f"Network gating validation passed: Clawdbot Gateway is {reachability} (risk: {risk})")
+        logger.info(f"Network gating validation passed: Bot gateway is {reachability} (risk: {risk})")
     
     logger.info("EDON Gateway startup complete")
 
@@ -336,12 +336,13 @@ class MetricsResponse(BaseModel):
 
 
 @app.post("/execute", response_model=ExecuteResponse)
-async def execute_action(request: ExecuteRequest):
+async def execute_action(request: ExecuteRequest, http_request: Request):
     """Execute a single action through governance.
     
-    This is the main entry point. Clawdbot calls this for every tool action.
+    This is the main entry point. Edonbot (or the Telegram bot) calls this for every tool action.
     """
     try:
+        tenant_id = action.params.get("_tenant_id")
         # Input validation
         if not request.agent_id or not request.agent_id.strip():
             raise HTTPException(status_code=400, detail="agent_id is required")
@@ -398,6 +399,12 @@ async def execute_action(request: ExecuteRequest):
             params=request.action.get("params", {}),
             source=ActionSource.AGENT
         )
+
+        # Attach tenant context (authoritative, server-side)
+        tenant_id = getattr(http_request.state, "tenant_id", None)
+        if tenant_id:
+            # Do not trust any client-provided tenant_id
+            action.params["_tenant_id"] = tenant_id
         
         # Check credentials in strict mode BEFORE governor evaluation
         # This ensures we fail closed even if action would be blocked by policy
@@ -407,8 +414,18 @@ async def execute_action(request: ExecuteRequest):
         if credentials_strict:
             # In strict mode, require credentials for tool execution
             tool_name = action.tool.value if hasattr(action.tool, 'value') else str(action.tool)
-            tool_credentials = db.get_credentials_by_tool(tool_name)
-            
+            # Memory tool is internal; no external credentials required
+            if tool_name != "memory":
+                tool_credentials = db.get_credentials_by_tool(tool_name)
+                if tenant_id:
+                    # Require tenant-scoped credential or explicit global credential
+                    tool_credentials = [
+                        c for c in tool_credentials
+                        if c.get("tenant_id") in (tenant_id, None, "")
+                    ]
+            else:
+                tool_credentials = ["internal"]
+
             if not tool_credentials:
                 # Fail closed - return 503 before any execution
                 raise HTTPException(
@@ -493,6 +510,20 @@ async def execute_action(request: ExecuteRequest):
         if decision.verdict == Verdict.ALLOW:
             try:
                 execution = _execute_tool(action)
+                # Observation hook: lightweight "did this work?" check
+                try:
+                    from .observation import observe
+                    obs = observe(
+                        action.tool.value,
+                        action.op,
+                        execution or {},
+                        action.params or {},
+                        tenant_id=tenant_id,
+                    )
+                    if obs and isinstance(execution, dict):
+                        execution["observation"] = obs
+                except Exception:
+                    pass
             except RuntimeError as e:
                 # Credential errors in strict mode
                 if "Credential" in str(e) and "not found" in str(e):
@@ -505,6 +536,20 @@ async def execute_action(request: ExecuteRequest):
             # Execute degraded action
             try:
                 execution = _execute_tool(decision.safe_alternative)
+                try:
+                    from .observation import observe
+                    alt = decision.safe_alternative
+                    obs = observe(
+                        alt.tool.value,
+                        alt.op,
+                        execution or {},
+                        alt.params or {},
+                        tenant_id=tenant_id,
+                    )
+                    if obs and isinstance(execution, dict):
+                        execution["observation"] = obs
+                except Exception:
+                    pass
             except RuntimeError as e:
                 # Credential errors in strict mode
                 if "Credential" in str(e) and "not found" in str(e):
@@ -529,7 +574,9 @@ async def execute_action(request: ExecuteRequest):
             explanation=decision.explanation,
             safe_alternative=decision.safe_alternative.to_dict() if decision.safe_alternative else None,
             execution=execution,
-            timestamp=datetime.now(UTC).isoformat()
+            timestamp=datetime.now(UTC).isoformat(),
+            escalation_question=getattr(decision, "escalation_question", None),
+            escalation_options=getattr(decision, "escalation_options", None),
         )
         
     except HTTPException:
@@ -614,6 +661,26 @@ async def get_intent(intent_id: str):
     )
 
 
+class PlanRequest(BaseModel):
+    """Request body for POST /plan."""
+    objective: str
+    context: Optional[Dict[str, Any]] = None
+
+
+@app.post("/plan")
+async def create_plan(req: PlanRequest):
+    """Decompose an objective into steps (read/draft/execute). Non-executing; execution still via POST /execute."""
+    from .planner import plan as plan_decompose
+    try:
+        if not (req.objective and req.objective.strip()):
+            raise HTTPException(status_code=400, detail="objective is required")
+        return plan_decompose(req.objective, req.context or {})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.get("/audit/query", response_model=AuditQueryResponse)
 async def query_audit(
     agent_id: Optional[str] = None,
@@ -691,13 +758,16 @@ async def get_decision(decision_id: str):
 
 
 @app.get("/health", response_model=HealthResponse)
+@app.head("/health")
 @app.get("/healthz", response_model=HealthResponse)  # Render health check alias
-async def health():
-    """Health check endpoint for load balancers and monitoring."""
-    import time
+@app.head("/healthz")
+async def health(request: Request):
+    """Health check endpoint for load balancers and monitoring. Supports GET and HEAD."""
+    # HEAD: no body (RFC 7231)
+    if request.method == "HEAD":
+        return Response(status_code=200)
     # Simple uptime tracking (Phase C: will be more sophisticated)
     uptime_seconds = int(time.time() - app.state.start_time) if hasattr(app.state, 'start_time') else 0
-    
     # Get active policy preset
     active_preset = db.get_active_policy_preset()
     preset_info = None
@@ -706,7 +776,6 @@ async def health():
             "preset_name": active_preset["preset_name"],
             "applied_at": active_preset["applied_at"]
         }
-    
     return HealthResponse(
         status="healthy",
         version="1.0.0",
@@ -757,12 +826,12 @@ async def apply_policy_pack_endpoint(
     request: Request,
     objective: Optional[str] = None
 ):
-    """Apply a policy pack and create an intent with clawdbot.invoke scope.
-    
+"""Apply a policy pack and create an intent with clawdbot.invoke scope.
+
     This creates an intent contract that includes clawdbot.invoke in scope,
-    ensuring Clawdbot users have a smooth experience without "not in scope" errors.
-    
-    For Clawdbot-specific packs (e.g., clawdbot_safe), the constraints include
+    ensuring Edonbot users have a smooth experience without "not in scope" errors.
+
+    For bot-specific packs (e.g., clawdbot_safe), the constraints include
     the allowed_clawdbot_tools list which is enforced during action evaluation.
     
     Args:
@@ -787,13 +856,13 @@ async def apply_policy_pack_endpoint(
     try:
         intent_dict = apply_policy_pack(pack_name, objective)
         
-        # Ensure clawdbot.invoke is in scope (critical for Clawdbot users)
+        # Ensure clawdbot.invoke is in scope (critical for Edonbot users)
         if "clawdbot" not in intent_dict["scope"]:
             intent_dict["scope"]["clawdbot"] = []
         if "invoke" not in intent_dict["scope"]["clawdbot"]:
             intent_dict["scope"]["clawdbot"].append("invoke")
         
-        # For Clawdbot-specific packs, ensure constraints include allowed_clawdbot_tools
+        # For bot-specific packs, ensure constraints include allowed_clawdbot_tools
         # This is already set in the pack definition, but we validate it here
         if pack_name == "clawdbot_safe" or "clawdbot" in intent_dict.get("scope", {}):
             constraints = intent_dict.get("constraints", {})
@@ -1198,9 +1267,9 @@ async def delete_credential(credential_id: str):
     return {"status": "deleted", "credential_id": credential_id}
 
 
-# Clawdbot Proxy Endpoint - Drop-in replacement for Clawdbot Gateway /tools/invoke
+# Edonbot Proxy Endpoint - Drop-in replacement for bot gateway /tools/invoke
 class ClawdbotInvokeRequest(BaseModel):
-    """Clawdbot invoke request - mirrors Clawdbot Gateway schema exactly."""
+    """Edonbot invoke request - mirrors bot gateway schema exactly."""
     tool: str
     action: str = "json"
     args: Dict[str, Any] = {}
@@ -1208,7 +1277,7 @@ class ClawdbotInvokeRequest(BaseModel):
 
 
 class ClawdbotInvokeResponse(BaseModel):
-    """Clawdbot invoke response - mirrors Clawdbot Gateway schema."""
+    """Edonbot invoke response - mirrors bot gateway schema."""
     ok: bool
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
@@ -1230,9 +1299,9 @@ async def edon_invoke_alias(
     x_intent_id: Optional[str] = Header(None, alias="X-Intent-ID")
 ):
     """Alias for /clawdbot/invoke - provides prettier endpoint name.
-    
+
     This endpoint calls the same handler as /clawdbot/invoke.
-    Use /clawdbot/invoke for the canonical adoption endpoint.
+    Use /clawdbot/invoke for the canonical adoption endpoint (Edonbot).
     """
     # Call the same handler function
     return await clawdbot_invoke_proxy(
@@ -1252,23 +1321,23 @@ async def clawdbot_invoke_proxy(
     x_edon_agent_id: Optional[str] = Header(None, alias="X-EDON-Agent-ID"),
     x_intent_id: Optional[str] = Header(None, alias="X-Intent-ID")
 ):
-    """EDON Proxy Runner - Drop-in replacement for Clawdbot Gateway /tools/invoke.
+    """EDON Proxy Runner - Drop-in replacement for bot gateway /tools/invoke.
     
-    This endpoint mirrors Clawdbot's exact schema, allowing users to switch from:
-        POST clawdbot-gateway/tools/invoke
+    This endpoint mirrors Edonbot's exact schema, allowing users to switch from:
+        POST bot-gateway/tools/invoke
     to:
         POST edon-gateway/clawdbot/invoke
     
     in 5 minutes with zero code changes.
     
     **How it works:**
-    1. Accepts Clawdbot's exact request schema
+    1. Accepts Edonbot's exact request schema
     2. Converts to EDON Action format
     3. Evaluates through EDON governance
-    4. If ALLOW → calls Clawdbot Gateway
-    5. If BLOCK → returns BLOCK + explanation (Clawdbot never receives call)
+    4. If ALLOW → calls bot gateway
+    5. If BLOCK → returns BLOCK + explanation (bot never receives call)
     
-    **Request Schema (matches Clawdbot exactly):**
+    **Request Schema (matches Edonbot exactly):**
     ```json
     {
       "tool": "sessions_list",
@@ -1278,7 +1347,7 @@ async def clawdbot_invoke_proxy(
     }
     ```
     
-    **Response Schema (matches Clawdbot, with EDON transparency):**
+    **Response Schema (matches Edonbot, with EDON transparency):**
     ```json
     {
       "ok": true,
@@ -1292,18 +1361,18 @@ async def clawdbot_invoke_proxy(
     ```json
     {
       "ok": false,
-      "error": "Clawdbot tool 'web_execute' not in allowed list",
+      "error": "Edonbot tool 'web_execute' not in allowed list",
       "edon_verdict": "BLOCK",
-      "edon_explanation": "Clawdbot tool 'web_execute' not in allowed list. Allowed: ['sessions_list']"
+      "edon_explanation": "Edonbot tool 'web_execute' not in allowed list. Allowed: ['sessions_list']"
     }
     ```
     """
     try:
         # Get agent_id from headers (prefer X-EDON-Agent-ID, fallback to X-Agent-ID, then default)
-        agent_id = x_edon_agent_id or x_agent_id or "clawdbot-agent"
+        agent_id = x_edon_agent_id or x_agent_id or "edonbot-agent"
         intent_id = x_intent_id
         
-        # Convert Clawdbot request to EDON Action format
+        # Convert Edonbot request to EDON Action format
         action = Action(
             tool=Tool.CLAWDBOT,
             op="invoke",
@@ -1364,7 +1433,7 @@ async def clawdbot_invoke_proxy(
             if not tool_credentials:
                 return ClawdbotInvokeResponse(
                     ok=False,
-                    error=f"Service unavailable: No credentials found for tool 'clawdbot'. EDON_CREDENTIALS_STRICT=true requires credentials to be stored in database.",
+                    error=f"Service unavailable: No credentials found for tool 'clawdbot' (Edonbot). EDON_CREDENTIALS_STRICT=true requires credentials to be stored in database.",
                     edon_verdict="BLOCK",
                     edon_explanation="Credentials not configured"
                 )
@@ -1388,7 +1457,7 @@ async def clawdbot_invoke_proxy(
             logging.error(f"Failed to save audit event: {str(e)}")
             decision_id = f"dec-{action.id}-{datetime.now(UTC).isoformat()}"
         
-        # If BLOCK/ESCALATE/PAUSE, return error (Clawdbot never receives call)
+        # If BLOCK/ESCALATE/PAUSE, return error (bot never receives call)
         if decision.verdict not in [Verdict.ALLOW, Verdict.DEGRADE]:
             return ClawdbotInvokeResponse(
                 ok=False,
@@ -1397,7 +1466,7 @@ async def clawdbot_invoke_proxy(
                 edon_explanation=decision.explanation
             )
         
-        # ALLOW or DEGRADE → Execute through Clawdbot connector
+        # ALLOW or DEGRADE → Execute through Edonbot connector
         # Load credential from DB and create connector instance
         try:
             from .connectors.clawdbot_connector import ClawdbotConnector
@@ -1420,7 +1489,7 @@ async def clawdbot_invoke_proxy(
                 sessionKey=payload.sessionKey
             )
             
-            # Convert EDON connector result to Clawdbot format
+            # Convert EDON connector result to Edonbot format
             if result.get("success"):
                 return ClawdbotInvokeResponse(
                     ok=True,
@@ -1445,7 +1514,7 @@ async def clawdbot_invoke_proxy(
             
     except Exception as e:
         import logging
-        logging.error(f"Clawdbot proxy error: {str(e)}", exc_info=True)
+        logging.error(f"Edonbot proxy error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Proxy error: {str(e)}"
@@ -1530,10 +1599,7 @@ def _execute_tool(action: Action) -> Dict[str, Any]:
                 from .connectors.clawdbot_connector import ClawdbotConnector
                 
                 # Get tenant_id if available (from request context if available)
-                tenant_id = None
-                # Note: In _execute_tool, we don't have direct access to request
-                # This is called from /execute endpoint which has request context
-                # For now, use default credential_id
+                # Note: tenant_id is injected into action.params by /execute
                 credential_id = config.CLAWDBOT_CREDENTIAL_ID
                 
                 # Create connector instance with credential_id (loads from DB)
@@ -1551,7 +1617,7 @@ def _execute_tool(action: Action) -> Dict[str, Any]:
                     "op": action.op,
                     "result": {
                         "success": False,
-                        "error": f"Unknown clawdbot operation: {action.op}"
+                        "error": f"Unknown Edonbot operation: {action.op}"
                     }
                 }
             
@@ -1560,6 +1626,170 @@ def _execute_tool(action: Action) -> Dict[str, Any]:
                 "op": action.op,
                 "result": result
             }
+        
+        elif action.tool == Tool.BRAVE_SEARCH:
+            if action.op == "search":
+                from .connectors.brave_search_connector import BraveSearchConnector
+                connector = BraveSearchConnector(tenant_id=tenant_id)
+                result = connector.search(
+                    q=action.params.get("q", ""),
+                    count=action.params.get("count", 10),
+                    country=action.params.get("country"),
+                    freshness=action.params.get("freshness"),
+                )
+            else:
+                return {
+                    "tool": action.tool.value,
+                    "op": action.op,
+                    "result": {"success": False, "error": f"Unknown brave_search operation: {action.op}"}
+                }
+            return {"tool": action.tool.value, "op": action.op, "result": result}
+        
+        elif action.tool == Tool.GMAIL:
+            from .connectors.gmail_connector import GmailConnector
+            connector = GmailConnector(tenant_id=tenant_id)
+            if action.op == "list_messages":
+                result = connector.list_messages(
+                    max_results=action.params.get("max_results", 10),
+                    q=action.params.get("q"),
+                    label_ids=action.params.get("label_ids"),
+                )
+            elif action.op == "get_message":
+                result = connector.get_message(
+                    message_id=action.params.get("message_id", ""),
+                    format=action.params.get("format", "metadata"),
+                )
+            elif action.op == "send":
+                result = connector.send_message(
+                    to=action.params.get("to"),
+                    recipients=action.params.get("recipients"),
+                    subject=action.params.get("subject", ""),
+                    body=action.params.get("body", ""),
+                )
+            else:
+                return {
+                    "tool": action.tool.value,
+                    "op": action.op,
+                    "result": {"success": False, "error": f"Unknown gmail operation: {action.op}"}
+                }
+            return {"tool": action.tool.value, "op": action.op, "result": result}
+        
+        elif action.tool == Tool.GOOGLE_CALENDAR:
+            from .connectors.google_calendar_connector import GoogleCalendarConnector
+            connector = GoogleCalendarConnector(tenant_id=tenant_id)
+            if action.op == "list_events":
+                result = connector.list_events(
+                    calendar_id=action.params.get("calendar_id"),
+                    time_min=action.params.get("time_min"),
+                    time_max=action.params.get("time_max"),
+                    max_results=action.params.get("max_results", 20),
+                    single_events=action.params.get("single_events", True),
+                )
+            elif action.op == "create_event":
+                result = connector.create_event(
+                    calendar_id=action.params.get("calendar_id"),
+                    summary=action.params.get("summary", ""),
+                    description=action.params.get("description"),
+                    start=action.params.get("start"),
+                    end=action.params.get("end"),
+                    location=action.params.get("location"),
+                )
+            else:
+                return {
+                    "tool": action.tool.value,
+                    "op": action.op,
+                    "result": {"success": False, "error": f"Unknown google_calendar operation: {action.op}"}
+                }
+            return {"tool": action.tool.value, "op": action.op, "result": result}
+        
+        elif action.tool == Tool.ELEVENLABS:
+            from .connectors.elevenlabs_connector import ElevenLabsConnector
+            connector = ElevenLabsConnector(tenant_id=tenant_id)
+            if action.op == "text_to_speech":
+                result = connector.text_to_speech(
+                    text=action.params.get("text", ""),
+                    voice_id=action.params.get("voice_id", "21m00Tcm4TlvDq8ikWAM"),
+                    model_id=action.params.get("model_id", "eleven_monolingual_v1"),
+                    voice_settings=action.params.get("voice_settings", {}),
+                )
+            elif action.op == "list_voices":
+                result = connector.list_voices()
+            else:
+                return {
+                    "tool": action.tool.value,
+                    "op": action.op,
+                    "result": {"success": False, "error": f"Unknown elevenlabs operation: {action.op}"}
+                }
+            return {"tool": action.tool.value, "op": action.op, "result": result}
+        
+        elif action.tool == Tool.GITHUB:
+            from .connectors.github_connector import GitHubConnector
+            connector = GitHubConnector(tenant_id=tenant_id)
+            if action.op == "list_repos":
+                result = connector.list_repos(
+                    visibility=action.params.get("visibility", "all"),
+                    per_page=action.params.get("per_page", 30),
+                )
+            elif action.op == "get_file":
+                result = connector.get_file(
+                    owner=action.params.get("owner", ""),
+                    repo=action.params.get("repo", ""),
+                    path=action.params.get("path", ""),
+                )
+            elif action.op == "create_issue":
+                result = connector.create_issue(
+                    owner=action.params.get("owner", ""),
+                    repo=action.params.get("repo", ""),
+                    title=action.params.get("title", ""),
+                    body=action.params.get("body"),
+                    labels=action.params.get("labels"),
+                )
+            else:
+                return {
+                    "tool": action.tool.value,
+                    "op": action.op,
+                    "result": {"success": False, "error": f"Unknown github operation: {action.op}"}
+                }
+            return {"tool": action.tool.value, "op": action.op, "result": result}
+        
+        elif action.tool == Tool.MEMORY:
+            from .connectors.memory_connector import MemoryConnector
+            if not tenant_id:
+                return {
+                    "tool": action.tool.value,
+                    "op": action.op,
+                    "result": {"success": False, "error": "tenant_id required for memory operations"},
+                }
+            connector = MemoryConnector(tenant_id=tenant_id)
+            if action.op == "write_preference":
+                result = connector.write_preference(
+                    key=action.params.get("key", ""),
+                    value=action.params.get("value", ""),
+                )
+            elif action.op == "read_preferences":
+                result = connector.read_preferences(keys=action.params.get("keys"))
+            elif action.op == "append_episode":
+                result = connector.append_episode(
+                    episode_id=action.params.get("episode_id", ""),
+                    task_summary=action.params.get("task_summary", ""),
+                    outcome=action.params.get("outcome"),
+                    tool=action.params.get("tool"),
+                    op=action.params.get("op"),
+                    context=action.params.get("context"),
+                )
+            elif action.op == "query_episodes":
+                result = connector.query_episodes(
+                    limit=action.params.get("limit", 50),
+                    since=action.params.get("since"),
+                    tool=action.params.get("tool"),
+                )
+            else:
+                return {
+                    "tool": action.tool.value,
+                    "op": action.op,
+                    "result": {"success": False, "error": f"Unknown memory operation: {action.op}"}
+                }
+            return {"tool": action.tool.value, "op": action.op, "result": result}
         
         else:
             # Other tools not yet implemented
@@ -2260,7 +2490,7 @@ async def get_integrations(request: Request):
     """Get integration details for the authenticated tenant.
     
     Returns:
-        Clawdbot endpoint URL and instructions
+        Edonbot endpoint URL and instructions
     """
     return await integrations_account_handler(request)
 

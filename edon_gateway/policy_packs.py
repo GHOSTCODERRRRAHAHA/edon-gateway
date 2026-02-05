@@ -1,5 +1,5 @@
 """
-Policy Packs - Pre-configured policy modes for Clawdbot users.
+Policy Packs - Pre-configured policy modes for Edonbot users.
 
 Users don't want to design policies. They want presets.
 
@@ -271,7 +271,9 @@ POLICY_PACKS = {
     "ops_commander": OPS_COMMANDER,
     "founder_mode": FOUNDER_MODE,
     "helpdesk": HELPDESK,
-    "autonomy_mode": AUTONOMY_MODE
+    "autonomy_mode": AUTONOMY_MODE,
+    # Backwards-compat alias used by regression tests / older clients
+    "clawdbot_safe": AUTONOMY_MODE
 }
 
 

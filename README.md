@@ -1,14 +1,40 @@
 # EDON Gateway
 
-Local Action Proxy for Clawdbot - Hard Boundary Architecture
+**Purpose**: Backend API gateway that connects to clawdbots/agents and enforces security policies.
+
+This is the **core backend component** that:
+- Connects to user's clawdbots/AI agents
+- Enforces security policies and governance
+- Processes all agent actions through a security layer
+- Provides audit logging and metrics
+- Manages subscriptions and billing (Stripe webhooks)
 
 ## Architecture
 
 ```
-Clawdbot → EDON Gateway → Tools
+Clawdbot/Agent → EDON Gateway → Tools/Connectors
 ```
 
-Clawdbot never calls tools directly. All tool execution goes through `/execute`.
+Clawdbot/agents never call tools directly. All tool execution goes through `/execute` endpoint, which enforces security policies before allowing actions.
+
+## Full Stack Context
+
+This gateway is part of a three-component system:
+
+1. **edon-sentinel-core** (`D:\dev\edon-sentinel-core`): Public website where users sign up and pay
+2. **edon-agent-ui** (`C:\Users\cjbig\Desktop\edon-agent-ui`): Agent Console where users monitor their agents
+3. **edon_gateway** (this): Backend API that processes agent actions
+
+See `../STARTUP_GUIDE.md` for full stack startup instructions.
+
+## UI
+
+The EDON Gateway ships **API only**; it does not ship a user interface.
+
+User-facing UI lives in a separate project:
+- **edon-agent-ui**
+
+The gateway exposes a JSON/HTTP API consumed by external UIs. The UI (edon-agent-ui) communicates with the gateway over HTTP using the same auth header (`X-EDON-TOKEN`).
 
 ## Quick Start
 

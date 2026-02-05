@@ -479,14 +479,23 @@ def run_regression_tests():
                 results["skipped_reasons"].append(f"{test_name}: {out[1]}")
             else:
                 results["passed"] += 1
-        except pytest.SkipTest as e:
-            results["skipped"] += 1
-            results["skipped_reasons"].append(f"{test_name}: {e}")
         except AssertionError as e:
             print(f"  [FAIL] FAILED: {str(e)}")
             results["failed"] += 1
             results["errors"].append(f"{test_name}: {str(e)}")
-        except Exception as e:
+        except BaseException as e:
+            # pytest skip exception class differs across versions
+            skip_exc = getattr(pytest, "SkipTest", None)
+            if skip_exc and isinstance(e, skip_exc):
+                results["skipped"] += 1
+                results["skipped_reasons"].append(f"{test_name}: {e}")
+                continue
+            if e.__class__.__name__.lower().startswith("skip"):
+                results["skipped"] += 1
+                results["skipped_reasons"].append(f"{test_name}: {e}")
+                continue
+            if isinstance(e, SystemExit):
+                raise
             print(f"  [FAIL] ERROR: {str(e)}")
             results["failed"] += 1
             results["errors"].append(f"{test_name}: {str(e)}")

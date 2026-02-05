@@ -1,0 +1,83 @@
+# CI for EDON Gateway standalone repo.
+#
+# Uvicorn entrypoint: edon_gateway.main:app
+# (FastAPI app is defined in edon_gateway/edon_gateway/main.py as app = FastAPI(...))
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    env:
+      EDON_AUTH_ENABLED: "true"
+      EDON_API_TOKEN: "env:
+  EDON_AUTH_ENABLED: true
+  EDON_API_TOKEN: ci-test-token"
+      EDON_CREDENTIALS_STRICT: "false"
+      EDON_DB_URL: "sqlite:///./ci_edon.db"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            pip install -e .
+          else
+            echo "No requirements.txt or pyproject.toml found"
+            exit 1
+          fi
+
+      - name: Start uvicorn (background)
+        run: |
+          PYTHONPATH=. python -m uvicorn edon_gateway.main:app --host 127.0.0.1 --port 8000 --log-level debug > uvicorn.log 2>&1 &
+          echo $! > uvicorn.pid
+
+      - name: Wait for server ready
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/ || true)
+            if [ "$code" != "000" ]; then
+              echo "Server responding with HTTP $code after $i attempts"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Timeout waiting for server"
+          echo "=== Last 200 lines of uvicorn.log ==="
+          tail -200 uvicorn.log || true
+          exit 1
+
+      - name: Run regression tests
+        run: python test_regression.py
+        env:
+          EDON_GATEWAY_URL: http://127.0.0.1:8000
+
+      - name: Show uvicorn log on failure
+        if: always()
+        run: |
+          if [ -f uvicorn.log ]; then
+            echo "=== Last 200 lines of uvicorn.log ==="
+            tail -200 uvicorn.log
+          fi
+
+      - name: Stop uvicorn
+        if: always()
+        run: |
+          if [ -f uvicorn.pid ]; then
+            kill $(cat uvicorn.pid) || true
+          fi

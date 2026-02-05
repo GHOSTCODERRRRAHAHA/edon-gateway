@@ -11,10 +11,27 @@ This checklist outlines the steps needed to make EDON Gateway production-ready f
 
 ---
 
+## One-Click Readiness Tools
+
+Use these scripts to provision credentials and run the full production safety regression suite:
+
+- `one_click_prod_readiness.ps1` — health checks + regression tests
+- `provision_credentials.ps1` — push tool credentials to the gateway
+
+Example:
+```
+.\provision_credentials.ps1
+.\one_click_prod_readiness.ps1
+```
+
+Both scripts read `EDON_GATEWAY_URL` and `EDON_API_TOKEN` from your environment.
+
+---
+
 ## ✅ Already Complete
 
 ### Core Features
-- ✅ Clawdbot integration and proxy endpoint
+- ✅ Edonbot integration and proxy endpoint
 - ✅ Policy packs (Personal Safe, Work Safe, Ops/Admin)
 - ✅ Anti-bypass security (network gating, token hardening)
 - ✅ Safety UX dashboard (React UI integrated)
@@ -204,7 +221,7 @@ This checklist outlines the steps needed to make EDON Gateway production-ready f
 - [x] API documentation (OpenAPI/Swagger - auto-generated)
 - [x] Troubleshooting guide
 - [x] FAQ document
-- [x] Migration guide from Clawdbot (included in guides)
+- [x] Migration guide from Edonbot (included in guides)
 - [x] Best practices guide
 
 **Current State:**

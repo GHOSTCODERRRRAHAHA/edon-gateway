@@ -1,5 +1,7 @@
 # Bypass Prevention Architecture
 
+> **📘 Network Isolation Implementation**: See `NETWORK_ISOLATION_GUIDE.md` for detailed instructions on implementing Option B (network isolation) with Docker, firewall rules, or reverse proxy.
+
 **Goal:** Prove "EDON is the only path to side effects."
 
 ---

@@ -1,111 +1,128 @@
-# EDON Gateway Quick Start
+# EDON + Clawdbot - 5 Minute Setup
 
-## Server is Running! ✅
+## Two Commands, Maximum
 
-Your gateway is running on `http://localhost:8000`
-
-## Test the Gateway
-
-### Option 1: Use the Test Script
-
-In a **new terminal** (keep the server running):
+### 1. Connect Clawdbot
 
 ```bash
-# Install requests if needed
-pip install requests
-
-# Run test script
-python edon_gateway/test_gateway.py
-```
-
-### Option 2: Manual Testing with curl
-
-```bash
-# Health check
-curl http://localhost:8000/health
-
-# Set intent
-curl -X POST http://localhost:8000/intent/set \
+curl -X POST http://localhost:8000/integrations/clawdbot/connect \
+  -H "X-EDON-TOKEN: your-token" \
   -H "Content-Type: application/json" \
   -d '{
-    "objective": "Manage inbox. Drafts only.",
-    "scope": {"email": ["draft"], "calendar": ["view"]},
-    "constraints": {"drafts_only": true, "max_recipients": 3},
-    "risk_level": "low",
-    "approved_by_user": true
-  }'
-
-# Execute action (replace INTENT_ID from previous response)
-curl -X POST http://localhost:8000/execute \
-  -H "Content-Type: application/json" \
-  -d '{
-    "action": {
-      "tool": "email",
-      "op": "draft",
-      "params": {
-        "recipients": ["user@example.com"],
-        "subject": "Test",
-        "body": "Body"
-      }
-    },
-    "intent_id": "INTENT_ID",
-    "agent_id": "clawdbot-001"
+    "base_url": "http://127.0.0.1:18789",
+    "auth_mode": "password",
+    "secret": "local-dev",
+    "probe": true
   }'
 ```
 
-### Option 3: Use the SDK
-
-```python
-from edon_guard_sdk import EDONClient, ActionBlockedError
-
-client = EDONClient(
-    gateway_url="http://localhost:8000",
-    agent_id="clawdbot-001"
-)
-
-# Set intent
-intent_id = client.set_intent(
-    objective="Manage inbox. Drafts only.",
-    scope={"email": ["draft"]},
-    constraints={"drafts_only": True}
-)
-
-# Execute action
-try:
-    result = client.execute(
-        tool="email",
-        op="draft",
-        params={"recipients": ["user@example.com"], "subject": "Test", "body": "Body"},
-        intent_id=intent_id
-    )
-    print(f"Success: {result['verdict']}")
-except ActionBlockedError as e:
-    print(f"Blocked: {e}")
+**Response:**
+```json
+{
+  "connected": true,
+  "credential_id": "clawdbot_gateway",
+  "base_url": "http://127.0.0.1:18789",
+  "auth_mode": "password",
+  "message": "Clawdbot connected. Credential saved."
+}
 ```
 
-## Next Steps
+### 2. Point Clawdbot to EDON
 
-1. **Test all endpoints** - Run the test script to verify everything works
-2. **Create real tool connectors** - Replace mock execution with real email/shell connectors
-3. **Integration test** - Test Clawdbot SDK → Gateway → Tool end-to-end
+Update your Clawdbot configuration to use EDON Gateway:
+
+**Before:**
+```
+POST http://127.0.0.1:18789/tools/invoke
+```
+
+**After:**
+```
+POST http://localhost:8000/clawdbot/invoke
+```
+
+**Headers:**
+- `X-EDON-TOKEN: your-token` (required)
+- `X-Agent-ID: your-agent-id` (optional)
+
+That's it! Clawdbot now routes through EDON for governance.
+
+## Optional: Apply Policy Pack
+
+```bash
+curl -X POST http://localhost:8000/policy-packs/clawdbot_safe/apply \
+  -H "X-EDON-TOKEN: your-token"
+```
+
+This sets a default intent so you don't need `X-Intent-ID` header.
+
+## Check Status
+
+```bash
+curl http://localhost:8000/account/integrations \
+  -H "X-EDON-TOKEN: your-token"
+```
+
+**Response:**
+```json
+{
+  "clawdbot": {
+    "connected": true,
+    "base_url": "http://127.0.0.1:18789",
+    "auth_mode": "password",
+    "last_ok_at": "2026-01-28T19:40:12Z",
+    "last_error": null,
+    "active_policy_pack": "clawdbot_safe",
+    "default_intent_id": "intent_abc123"
+  }
+}
+```
+
+## What Happens Now
+
+1. ✅ Clawdbot calls `POST /clawdbot/invoke` (instead of Clawdbot Gateway)
+2. ✅ EDON evaluates each tool call through governance
+3. ✅ If ALLOW → EDON forwards to Clawdbot Gateway
+4. ✅ If BLOCK → EDON returns error (Clawdbot never receives call)
+5. ✅ All decisions logged in audit trail
 
 ## Troubleshooting
 
-### Import Error: `edon_demo` not found
+**Error: "Connection validation failed"**
+- Check Clawdbot Gateway is running on `http://127.0.0.1:18789`
+- Verify `secret` matches your Clawdbot Gateway auth token
 
-Make sure you're running from the project root:
+**Error: "Missing authentication token"**
+- Add `X-EDON-TOKEN` header with your EDON API token
+
+**Error: "No intent configured"**
+- Apply a policy pack: `POST /policy-packs/clawdbot_safe/apply`
+- Or include `X-Intent-ID` header with a valid intent_id
+
+## Production Hardening: Enable Network Gating
+
+For production deployments, enable network gating to prevent agents from bypassing EDON Gateway:
+
 ```bash
-cd C:\Users\cjbig\Desktop\EDON\edon-cav-engine
-python -m edon_gateway.main
+# Set environment variable
+export EDON_NETWORK_GATING=true
 ```
 
-### Port 8000 already in use
+**What it does:**
+- Validates at startup that Clawdbot Gateway is not publicly reachable
+- Ensures Clawdbot Gateway is on loopback/private network only
+- Fails fast with clear error if bypass risk detected
 
-Change the port in `edon_gateway/main.py`:
-```python
-uvicorn.run(app, host="0.0.0.0", port=8001)  # Use 8001 instead
+**Setup options:**
+1. **Docker**: Use `docker-compose.network-isolation.yml` (see `NETWORK_ISOLATION_GUIDE.md`)
+2. **Firewall**: Restrict port 18789 to EDON Gateway IP only (see `scripts/setup-firewall-isolation.sh`)
+3. **Reverse Proxy**: Use nginx with IP whitelist (see `nginx/clawdbot-isolation.conf`)
+
+**Verification:**
+Check bypass risk status:
+```bash
+curl http://localhost:8000/account/integrations \
+  -H "X-EDON-TOKEN: your-token"
 ```
 
-### Gateway not responding
-
-Check that the server is running and check the logs for errors.
+Response includes `bypass_risk` and `clawdbot_reachability` fields. If `bypass_risk` is "high", follow the `recommendation` to fix.
